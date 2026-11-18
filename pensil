@@ -1,0 +1,383 @@
+PRAGMA foreign_keys = OFF;
+BEGIN TRANSACTION;
+CREATE TABLE IF NOT EXISTS apiaries (
+apiary_id INTEGER PRIMARY KEY,
+name TEXT NOT NULL,
+district TEXT NOT NULL,
+latitude REAL NOT NULL,
+longitude REAL NOT NULL,
+registration_number TEXT NOT NULL,
+honey_collection_site TEXT NOT NULL,
+vet_certificate_number TEXT NOT NULL,
+vet_certificate_valid_until TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hives (
+hive_id INTEGER PRIMARY KEY,
+apiary_id INTEGER NOT NULL,
+cluster_id INTEGER NOT NULL,
+hive_code TEXT NOT NULL,
+bee_subspecies TEXT NOT NULL,
+colony_origin TEXT NOT NULL,
+queen_year INTEGER NOT NULL,
+colony_vet_passport TEXT NOT NULL,
+FOREIGN KEY (apiary_id) REFERENCES apiaries(apiary_id)
+);
+CREATE TABLE IF NOT EXISTS daily_weather (
+weather_id INTEGER PRIMARY KEY,
+apiary_id INTEGER NOT NULL,
+record_date TEXT NOT NULL,
+ambient_temp_c REAL NOT NULL,
+ambient_humidity_pct REAL NOT NULL,
+precipitation_mm REAL NOT NULL,
+wind_speed_ms REAL NOT NULL,
+weather_condition TEXT NOT NULL,
+forecast_next_day_temp_c REAL NOT NULL,
+forecast_next_day_condition TEXT NOT NULL,
+FOREIGN KEY (apiary_id) REFERENCES apiaries(apiary_id)
+);
+CREATE TABLE IF NOT EXISTS hive_sensor_logs (
+log_id INTEGER PRIMARY KEY,
+hive_id INTEGER NOT NULL,
+record_date TEXT NOT NULL,
+internal_temp_c REAL NOT NULL,
+internal_humidity_pct REAL NOT NULL,
+co2_ppm INTEGER NOT NULL,
+hive_weight_kg REAL NOT NULL,
+daily_weight_delta_kg REAL NOT NULL,
+lid_opened_count INTEGER NOT NULL,
+lid_event_cause TEXT NOT NULL,
+is_tipped_over INTEGER NOT NULL,
+tipping_cause TEXT NOT NULL,
+sound_level_db REAL NOT NULL,
+bee_activity_index INTEGER NOT NULL,
+estimated_flights_count INTEGER NOT NULL,
+ambient_temp_c REAL NOT NULL,
+anomaly_flag INTEGER NOT NULL,
+anomaly_description TEXT,
+FOREIGN KEY (hive_id) REFERENCES hives(hive_id)
+);
+INSERT INTO apiaries (apiary_id, name, district, latitude, longitude, registration_number, honey_collection_site, vet_certificate_number, vet_certificate_valid_until) VALUES
+(1, 'Пасека Бурзян-1 (Заповедная)', 'Бурзянский район', 53.0345, 57.4412, '02-001482-РБ', 'Урочище Капова пещера, липово-разнотравный массив', 'ВСД-02-2024-884120', '2027-01-15'),
+(2, 'Пасека Иглинская-Липовая', 'Иглинский район', 54.8321, 56.4125, '02-002914-РБ', 'Лесной массив близ с. Охлебинино, липняк', 'ВСД-02-2024-884121', '2027-01-15'),
+(3, 'Пасека Нуримановская-Горная', 'Нуримановский район', 55.1840, 56.7120, '02-003511-РБ', 'Окрестности Красного Ключа, горное разнотравье', 'ВСД-02-2024-884122', '2027-01-15'),
+(4, 'Пасека Кугарчинская-Южная', 'Кугарчинский район', 52.7122, 56.6018, '02-004190-РБ', 'Пойма реки Большой Ик, гречишно-липовые угодья', 'ВСД-02-2024-884123', '2027-01-15'),
+(5, 'Пасека Белорецкая-Таёжная', 'Белорецкий район', 53.9615, 58.4150, '02-005704-РБ', 'Склоны хребта Крака, кипрейно-разнотравный участок', 'ВСД-02-2024-884124', '2027-01-15'),
+(6, 'Пасека Аургазинская-Степная', 'Аургазинский район', 54.0110, 55.8840, '02-006319-РБ', 'Окрестности д. Толбазы, донниково-подсолнечные поля', 'ВСД-02-2024-884125', '2027-01-15');
+WITH RECURSIVE seq_hives(n) AS (
+SELECT 1
+UNION ALL
+SELECT n + 1 FROM seq_hives WHERE n < 600
+)
+INSERT INTO hives (hive_id, apiary_id, cluster_id, hive_code, bee_subspecies, colony_origin, queen_year, colony_vet_passport)
+SELECT
+n AS hive_id,
+((n - 1) / 100) + 1 AS apiary_id,
+((n - 1) / 20) + 1 AS cluster_id,
+'RB-HIVE-' || printf('%04d', n) AS hive_code,
+CASE
+WHEN ((n - 1) / 100) + 1 IN (1, 5) THEN 'Apis mellifera mellifera (Бурзянская бортевая)'
+WHEN ((n - 1) / 100) + 1 IN (2, 3) THEN 'Apis mellifera mellifera (Башкирская популяция)'
+ELSE 'Apis mellifera carnica (Адаптированная линия)'
+END AS bee_subspecies,
+CASE
+WHEN n % 3 = 0 THEN 'Племенной репродуктор Бурзянского района'
+WHEN n % 3 = 1 THEN 'Собственный отводок пасеки'
+ELSE 'Башкирский НИЦ по пчеловодству и апитерапии'
+END AS colony_origin,
+2023 + (n % 3) AS queen_year,
+'ВП-02-' || printf('%06d', 100000 + n) AS colony_vet_passport
+FROM seq_hives;
+WITH RECURSIVE dates(d) AS (
+SELECT date('2024-01-01')
+UNION ALL
+SELECT date(d, '+1 day') FROM dates WHERE d < date('2026-12-31')
+),
+apiary_dates AS (
+SELECT
+a.apiary_id,
+d.d AS record_date,
+CAST(strftime('%j', d.d) AS INTEGER) AS doy,
+CAST(strftime('%Y', d.d) AS INTEGER) AS yr,
+CAST(strftime('%m', d.d) AS INTEGER) AS mo
+FROM apiaries a
+CROSS JOIN dates d
+),
+weather_calc AS (
+SELECT
+apiary_id,
+record_date,
+doy,
+yr,
+mo,
+ROUND(
+3.2
+- 18.8 * cos(6.283185307179586 * (doy - 18) / 365.25)
+- (apiary_id * 0.45)
++ (((doy * 37 + yr * 13 + apiary_id * 7) % 11) - 5) * 0.9,
+1
+) AS ambient_temp_c,
+((doy * 19 + yr * 29 + apiary_id * 17) % 100) AS rand_w
+FROM apiary_dates
+)
+INSERT INTO daily_weather (
+weather_id,
+apiary_id,
+record_date,
+ambient_temp_c,
+ambient_humidity_pct,
+precipitation_mm,
+wind_speed_ms,
+weather_condition,
+forecast_next_day_temp_c,
+forecast_next_day_condition
+)
+SELECT
+ROW_NUMBER() OVER (ORDER BY record_date, apiary_id) AS weather_id,
+apiary_id,
+record_date,
+ambient_temp_c,
+ROUND(
+CASE
+WHEN mo IN (11, 12, 1, 2) THEN 78.0 + (rand_w % 16)
+WHEN mo IN (6, 7, 8) THEN 54.0 + (rand_w % 28)
+ELSE 64.0 + (rand_w % 24)
+END,
+1
+) AS ambient_humidity_pct,
+ROUND(
+CASE
+WHEN rand_w < 68 THEN 0.0
+WHEN rand_w < 88 THEN ((rand_w - 67) * 0.35)
+ELSE ((rand_w - 87) * 1.4)
+END,
+1
+) AS precipitation_mm,
+ROUND(1.2 + ((doy * 13 + apiary_id * 5) % 9) * 0.85, 1) AS wind_speed_ms,
+CASE
+WHEN rand_w >= 88 AND ambient_temp_c <= 0 THEN 'Сильный снегопад, метель'
+WHEN rand_w >= 88 AND ambient_temp_c > 0 THEN 'Ливень, гроза'
+WHEN rand_w >= 68 AND ambient_temp_c <= 0 THEN 'Небольшой снег'
+WHEN rand_w >= 68 AND ambient_temp_c > 0 THEN 'Кратковременный дождь'
+WHEN rand_w >= 45 THEN 'Переменная облачность'
+ELSE 'Ясно'
+END AS weather_condition,
+ROUND(ambient_temp_c + (((doy + apiary_id) % 5) - 2) * 1.1, 1) AS forecast_next_day_temp_c,
+CASE
+WHEN ((rand_w + 15) % 100) >= 85 AND ambient_temp_c <= 0 THEN 'Снегопад'
+WHEN ((rand_w + 15) % 100) >= 85 AND ambient_temp_c > 0 THEN 'Дождь'
+WHEN ((rand_w + 15) % 100) >= 50 THEN 'Облачно с прояснениями'
+ELSE 'Малооблачно'
+END AS forecast_next_day_condition
+FROM weather_calc;
+WITH RECURSIVE dates(d) AS (
+SELECT date('2024-01-01')
+UNION ALL
+SELECT date(d, '+1 day') FROM dates WHERE d < date('2026-12-31')
+),
+base_grid AS (
+SELECT
+h.hive_id,
+h.apiary_id,
+h.cluster_id,
+d.d AS record_date,
+CAST(strftime('%j', d.d) AS INTEGER) AS doy,
+CAST(strftime('%Y', d.d) AS INTEGER) AS yr,
+CAST(strftime('%m', d.d) AS INTEGER) AS mo,
+w.ambient_temp_c,
+w.precipitation_mm,
+((h.cluster_id * 97 + CAST(strftime('%j', d.d) AS INTEGER) * 31 + CAST(strftime('%Y', d.d) AS INTEGER) * 17) % 1000) AS cluster_seed,
+((h.hive_id * 53 + CAST(strftime('%j', d.d) AS INTEGER) * 41 + CAST(strftime('%Y', d.d) AS INTEGER) * 19) % 1000) AS hive_seed
+FROM hives h
+JOIN daily_weather w ON w.apiary_id = h.apiary_id
+JOIN dates d ON d.d = w.record_date
+),
+events_calc AS (
+SELECT
+*,
+CASE
+WHEN apiary_id IN (1, 3, 5)
+AND mo BETWEEN 4 AND 10
+AND cluster_seed < 4
+AND hive_seed < 650 THEN 1
+ELSE 0
+END AS is_bear_attack,
+CASE
+WHEN mo BETWEEN 4 AND 9
+AND ((doy + cluster_id * 3) % 14 = 0)
+AND precipitation_mm < 2.0
+AND hive_seed < 820 THEN 1
+ELSE 0
+END AS is_beekeeper_inspection,
+CASE
+WHEN hive_seed IN (7, 13, 29, 41, 73, 89, 103, 151, 211, 307, 401, 509, 613, 719, 821, 911)
+AND (doy % 19 = 0) THEN 1
+ELSE 0
+END AS is_health_anomaly
+FROM base_grid
+),
+metrics_calc AS (
+SELECT
+hive_id,
+record_date,
+ambient_temp_c,
+is_bear_attack,
+is_beekeeper_inspection,
+is_health_anomaly,
+CASE
+WHEN is_bear_attack = 1 THEN 1
+WHEN is_beekeeper_inspection = 1 THEN 1
+WHEN hive_seed = 999 THEN 1
+ELSE 0
+END AS lid_opened_count,
+CASE
+WHEN is_bear_attack = 1 THEN 'Медведь'
+WHEN is_beekeeper_inspection = 1 THEN 'Пчеловод'
+WHEN hive_seed = 999 THEN 'Несанкционированное вскрытие / порыв ветра'
+ELSE 'Нет'
+END AS lid_event_cause,
+CASE
+WHEN is_bear_attack = 1 AND hive_seed < 520 THEN 1
+ELSE 0
+END AS is_tipped_over,
+CASE
+WHEN is_bear_attack = 1 AND hive_seed < 520 THEN 'Медведь'
+ELSE 'Нет'
+END AS tipping_cause,
+ROUND(
+CASE
+WHEN is_bear_attack = 1 AND hive_seed < 520 THEN ambient_temp_c + 4.5
+WHEN is_health_anomaly = 1 AND (hive_id % 3 = 0) THEN 39.2 + (hive_seed % 20) * 0.1
+WHEN is_health_anomaly = 1 AND (hive_id % 3 = 1) THEN 14.5 + (hive_seed % 30) * 0.1
+WHEN mo IN (11, 12, 1, 2, 3) THEN 23.5 + ((hive_seed % 30) * 0.1) + (ambient_temp_c * 0.08)
+ELSE 34.4 + ((hive_seed % 14) * 0.1)
+END,
+1
+) AS internal_temp_c,
+ROUND(
+CASE
+WHEN is_health_anomaly = 1 AND (hive_id % 2 = 0) THEN 88.0 + (hive_seed % 10)
+WHEN is_health_anomaly = 1 AND (hive_id % 2 = 1) THEN 34.0 + (hive_seed % 8)
+WHEN mo IN (6, 7) THEN 62.0 + (hive_seed % 14)
+WHEN mo IN (11, 12, 1, 2) THEN 72.0 + (hive_seed % 12)
+ELSE 56.0 + (hive_seed % 15)
+END,
+1
+) AS internal_humidity_pct,
+CASE
+WHEN is_health_anomaly = 1 AND (hive_id % 3 = 2) THEN 6800 + (hive_seed % 2500)
+WHEN mo IN (12, 1, 2) THEN 2400 + (hive_seed % 1100)
+WHEN mo IN (6, 7) THEN 950 + (hive_seed % 650)
+ELSE 1200 + (hive_seed % 700)
+END AS co2_ppm,
+ROUND(
+CASE
+WHEN doy < 130 THEN 42.0 - (doy * 0.085)
+WHEN doy BETWEEN 130 AND 175 THEN 31.0 + ((doy - 130) * 0.28)
+WHEN doy BETWEEN 176 AND 215 THEN 43.6 + ((doy - 175) * 1.15)
+WHEN doy BETWEEN 216 AND 235 THEN 89.6 - ((doy - 215) * 2.15)
+ELSE 46.6 - ((doy - 235) * 0.035)
+END
++ ((hive_id % 7) - 3) * 0.65
+- (CASE WHEN is_bear_attack = 1 THEN 6.5 ELSE 0.0 END),
+2
+) AS hive_weight_kg,
+ROUND(
+CASE
+WHEN is_bear_attack = 1 THEN -6.50
+WHEN doy BETWEEN 180 AND 205 AND precipitation_mm < 1.5 THEN 1.45 + ((hive_seed % 28) * 0.08)
+WHEN doy BETWEEN 150 AND 179 AND precipitation_mm < 1.5 THEN 0.35 + ((hive_seed % 15) * 0.04)
+WHEN doy IN (218, 222, 226) AND (hive_id % 4 = doy % 4) THEN -18.50
+ELSE -0.07 - ((hive_seed % 5) * 0.01)
+END,
+2
+) AS daily_weight_delta_kg,
+ROUND(
+CASE
+WHEN is_bear_attack = 1 THEN 78.5 + (hive_seed % 12)
+WHEN is_health_anomaly = 1 THEN 69.0 + (hive_seed % 11)
+WHEN doy BETWEEN 145 AND 175 AND (hive_id % 11 = 0) THEN 66.5 + (hive_seed % 8)
+WHEN mo IN (6, 7) THEN 52.0 + (hive_seed % 9)
+WHEN mo IN (12, 1, 2) THEN 36.0 + (hive_seed % 6)
+ELSE 44.0 + (hive_seed % 8)
+END,
+1
+) AS sound_level_db,
+CASE
+WHEN is_bear_attack = 1 AND hive_seed < 520 THEN 5
+WHEN mo IN (11, 12, 1, 2, 3) OR ambient_temp_c < 10.0 THEN 0 + (hive_seed % 4)
+WHEN precipitation_mm > 5.0 THEN 12 + (hive_seed % 15)
+WHEN doy BETWEEN 175 AND 210 AND ambient_temp_c BETWEEN 20.0 AND 31.0 THEN 82 + (hive_seed % 18)
+ELSE 45 + (hive_seed % 35)
+END AS bee_activity_index
+FROM events_calc
+)
+INSERT INTO hive_sensor_logs (
+log_id,
+hive_id,
+record_date,
+internal_temp_c,
+internal_humidity_pct,
+co2_ppm,
+hive_weight_kg,
+daily_weight_delta_kg,
+lid_opened_count,
+lid_event_cause,
+is_tipped_over,
+tipping_cause,
+sound_level_db,
+bee_activity_index,
+estimated_flights_count,
+ambient_temp_c,
+anomaly_flag,
+anomaly_description
+)
+SELECT
+ROW_NUMBER() OVER (ORDER BY record_date, hive_id) AS log_id,
+hive_id,
+record_date,
+internal_temp_c,
+internal_humidity_pct,
+co2_ppm,
+hive_weight_kg,
+daily_weight_delta_kg,
+lid_opened_count,
+lid_event_cause,
+is_tipped_over,
+tipping_cause,
+sound_level_db,
+bee_activity_index,
+bee_activity_index * 420 AS estimated_flights_count,
+ambient_temp_c,
+CASE
+WHEN is_tipped_over = 1
+OR is_bear_attack = 1
+OR is_health_anomaly = 1
+OR internal_temp_c > 38.0
+OR internal_temp_c < 18.0
+OR co2_ppm > 5500
+OR internal_humidity_pct > 85.0
+OR internal_humidity_pct < 42.0
+OR sound_level_db > 65.0
+OR lid_event_cause = 'Несанкционированное вскрытие / порыв ветра'
+THEN 1
+ELSE 0
+END AS anomaly_flag,
+CASE
+WHEN is_tipped_over = 1 THEN 'КРИТИЧЕСКАЯ ТРЕВОГА: Улей опрокинут (медведь), резкое падение веса и температуры'
+WHEN is_bear_attack = 1 THEN 'ТРЕВОГА: Нападение медведя, вскрыта крышка улья, высокий акустический фон'
+WHEN lid_event_cause = 'Несанкционированное вскрытие / порыв ветра' THEN 'ВНИМАНИЕ: Зафиксировано открытие крышки без планового осмотра'
+WHEN internal_temp_c > 38.0 THEN 'АНОМАЛИЯ: Перегрев гнезда выше 38°C, риск запаривания расплода'
+WHEN internal_temp_c < 18.0 THEN 'АНОМАЛИЯ: Критическое охлаждение клуба, угроза гибели семьи'
+WHEN co2_ppm > 5500 THEN 'АНОМАЛИЯ: Высокая концентрация CO2, нарушение вентиляции улья'
+WHEN internal_humidity_pct > 85.0 THEN 'АНОМАЛИЯ: Избыточная сырость в улье, риск аскосфероза и нозематоза'
+WHEN internal_humidity_pct < 42.0 THEN 'АНОМАЛИЯ: Низкая влажность, пересыхание открытого расплода'
+WHEN sound_level_db > 65.0 THEN 'АНОМАЛИЯ: Повышенный гул (роевое состояние или потеря матки)'
+ELSE 'Норма'
+END AS anomaly_description
+FROM metrics_calc;
+CREATE INDEX idx_logs_hive_date ON hive_sensor_logs(hive_id, record_date);
+CREATE INDEX idx_logs_date ON hive_sensor_logs(record_date);
+CREATE INDEX idx_logs_anomaly ON hive_sensor_logs(anomaly_flag);
+CREATE INDEX idx_hives_cluster ON hives(cluster_id);
+CREATE INDEX idx_weather_apiary_date ON daily_weather(apiary_id, record_date);
+COMMIT;
