@@ -1,1 +1,273 @@
+"""
+command_classifier.py
+Классификация пользовательских запросов по N командам через sentence embeddings.
+
+Зависимости:
+    pip install sentence-transformers numpy rapidfuzz
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+import numpy as np
+from rapidfuzz import fuzz, process as fuzz_process
+from sentence_transformers import SentenceTransformer, util
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# 1. Конфигурация команд
+# ----------------------------------------------------------------------------
+@dataclass
+class CommandConfig:
+    """Описание одной команды: ключ + набор примеров-парафразов."""
+    name: str
+    examples: List[str]
+    description: str = ""
+
+
+DEFAULT_COMMANDS: List[CommandConfig] = [
+    CommandConfig("where_to_go",    ["куда мне сегодня поехать", "куда сходить", "какое место посетить", "что посмотреть в городе"], "выбор места для поездки/прогулки"),
+    CommandConfig("flight_time",    ["когда будет вылет в локацию", "во сколько рейс", "время вылета самолёта", "когда самолёт в Москву"], "время/статус авиарейса"),
+    CommandConfig("weather",        ["какая погода", "будет ли дождь", "прогноз погоды на завтра", "сколько градусов на улице"], "прогноз погоды"),
+    CommandConfig("book_hotel",     ["забронируй отель", "нужен номер в гостинице", "забронировать жильё", "хочу снять квартиру на ночь"], "бронирование жилья"),
+    CommandConfig("find_food",      ["где поесть", "найди ресторан", "кафе рядом со мной", "хочу заказать еду"], "поиск еды/ресторана"),
+    CommandConfig("route",          ["построй маршрут", "как добраться до аэропорта", "проложи путь", "сколько ехать до центра"], "построение маршрута"),
+    CommandConfig("currency",       ["какой курс валют", "где обменник рядом", "курс доллара к рублю", "обменять деньги"], "курсы валют / обмен"),
+    CommandConfig("translate",      ["переведи текст", "как сказать на английском", "перевод с русского", "что значит это слово"], "перевод"),
+    CommandConfig("reminder",       ["напомни мне позвонить", "поставь напоминание", "не забудь напомнить завтра", "создай заметку с напоминанием"], "напоминания"),
+    CommandConfig("cancel_booking", ["отмени бронь", "отмени заказ", "хочу отменить бронирование", "убери мою бронь"], "отмена бронирования"),
+]
+
+
+# ----------------------------------------------------------------------------
+# 2. Основной классификатор
+# ----------------------------------------------------------------------------
+@dataclass
+class Prediction:
+    command: str
+    score: float          # нормированная "вероятность" (softmax)
+    raw_similarity: float # исходное косинусное сходство
+    def __repr__(self):
+        return f"{self.command}: {self.score:.3f} (cos={self.raw_similarity:.3f})"
+
+
+class CommandClassifier:
+    """
+    Zero-shot классификатор команд на эмбеддингах.
+
+    - Каждая команда представлена набором примеров; их эмбеддинги усредняются.
+    - Скор = косинусное сходство запроса с центроидом команды.
+    - Softmax с температурой → "вероятности".
+    - Порог unknown_threshold: если max(score) < порога → UNKNOWN.
+    - Опционально: fuzzy-коррекция опечаток по словарю примеров.
+    """
+
+    UNKNOWN = "__unknown__"
+
+    def __init__(
+        self,
+        commands: List[CommandConfig] | None = None,
+        model_name: str = "sergeyzh/rubert-tiny-turbo",
+        temperature: float = 0.05,
+        unknown_threshold: float = 0.35,
+        device: str | None = None,
+        enable_typo_fix: bool = True,
+        typo_min_len: int = 5,
+    ):
+        self.commands = commands or DEFAULT_COMMANDS
+        self.temperature = temperature
+        self.unknown_threshold = unknown_threshold
+        self.enable_typo_fix = enable_typo_fix
+        self.typo_min_len = typo_min_len
+
+        log.info("Загрузка модели %s ...", model_name)
+        self.model = SentenceTransformer(model_name, device=device)
+
+        self._build_index()
+        self._build_vocab()
+
+    # ---------- индексация команд ----------
+    def _build_index(self) -> None:
+        self.command_names: List[str] = []
+        centroids: List[np.ndarray] = []
+
+        for cmd in self.commands:
+            if not cmd.examples:
+                log.warning("Команда %s без примеров, пропускаю", cmd.name)
+                continue
+            embs = self.model.encode(
+                cmd.examples,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            centroid = embs.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm == 0:
+                log.warning("Нулевой центроид для %s, пропускаю", cmd.name)
+                continue
+            centroids.append(centroid / norm)
+            self.command_names.append(cmd.name)
+
+        self.centroids = np.vstack(centroids)  # (N_commands, dim)
+        log.info("Проиндексировано команд: %d", len(self.command_names))
+
+    # ---------- словарь для fuzzy-коррекции опечаток ----------
+    def _build_vocab(self) -> None:
+        self._vocab: List[str] = []
+        if not self.enable_typo_fix:
+            return
+        for cmd in self.commands:
+            for ex in cmd.examples:
+                self._vocab.extend(w.lower() for w in ex.split() if len(w) >= self.typo_min_len)
+        self._vocab = list(set(self._vocab))
+
+    def _fix_typos(self, text: str) -> str:
+        if not self.enable_typo_fix or not self._vocab:
+            return text
+        fixed_words = []
+        for word in text.split():
+            if len(word) < self.typo_min_len:
+                fixed_words.append(word)
+                continue
+            match, score, _ = fuzz_process.extractOne(word.lower(), self._vocab, scorer=fuzz.ratio)
+            if score is not None and score >= 85:
+                fixed_words.append(match)
+            else:
+                fixed_words.append(word)
+        return " ".join(fixed_words)
+
+    # ---------- инференс ----------
+    def predict(self, text: str, top_k: int = 3) -> List[Prediction]:
+        """Возвращает top_k предсказаний. Если max < порога — первым идёт UNKNOWN."""
+        if not text or not text.strip():
+            return [Prediction(self.UNKNOWN, 1.0, 0.0)]
+
+        text_fixed = self._fix_typos(text.strip())
+
+        q = self.model.encode(
+            text_fixed,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        sims = self.centroids @ q                        # (N_commands,) косинусы
+        probs = self._softmax(sims / self.temperature)
+
+        order = np.argsort(-probs)
+        ranked: List[Prediction] = [
+            Prediction(self.command_names[i], float(probs[i]), float(sims[i]))
+            for i in order[:top_k]
+        ]
+
+        if ranked[0].score < self.unknown_threshold:
+            return [Prediction(self.UNKNOWN, 1.0 - ranked[0].score, 0.0)] + ranked[: top_k - 1]
+        return ranked
+
+    def predict_one(self, text: str) -> Prediction:
+        return self.predict(text, top_k=1)[0]
+
+    def predict_batch(self, texts: List[str], top_k: int = 1) -> List[List[Prediction]]:
+        """Пакетный инференс — быстрее для больших объёмов."""
+        if not texts:
+            return []
+        fixed = [self._fix_typos(t.strip()) if t.strip() else "" for t in texts]
+        embs = self.model.encode(
+            fixed,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            batch_size=32,
+            show_progress_bar=False,
+        )
+        sims_all = embs @ self.centroids.T               # (B, N_commands)
+        results = []
+        for sims in sims_all:
+            probs = self._softmax(sims / self.temperature)
+            order = np.argsort(-probs)
+            ranked = [
+                Prediction(self.command_names[i], float(probs[i]), float(sims[i]))
+                for i in order[:top_k]
+            ]
+            if ranked[0].score < self.unknown_threshold:
+                ranked = [Prediction(self.UNKNOWN, 1.0 - ranked[0].score, 0.0)] + ranked[: top_k - 1]
+            results.append(ranked)
+        return results
+
+    @staticmethod
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        x = x - x.max()
+        e = np.exp(x)
+        return e / e.sum()
+
+    # ---------- утилиты ----------
+    def save_config(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                [{"name": c.name, "examples": c.examples, "description": c.description}
+                 for c in self.commands],
+                f, ensure_ascii=False, indent=2,
+            )
+
+    @classmethod
+    def from_config(cls, path: str, **kwargs) -> "CommandClassifier":
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        commands = [CommandConfig(**d) for d in data]
+        return cls(commands=commands, **kwargs)
+
+
+# ----------------------------------------------------------------------------
+# 3. Демонстрация
+# ----------------------------------------------------------------------------
+def _demo() -> None:
+    clf = CommandClassifier(unknown_threshold=0.30)
+
+    test_queries = [
+        "во сколько самолёт в Сочи?",
+        "посоветуй куда сгонять на выходные",
+        "нужен отель в Питере на два дня",
+        "какой сейчас курс евро",
+        "отмени мою бронь пожалуйста",
+        "перевиди это на английский",       # с опечаткой
+        "asdfghjkl",                          # мусор → UNKNOWN
+        "",
+    ]
+
+    print("\n" + "=" * 70)
+    for q in test_queries:
+        top = clf.predict(q, top_k=3)
+        print(f"\nЗапрос: {q!r}")
+        for p in top:
+            print(f"   {p}")
+    print("=" * 70)
+
+    # пакетный режим
+    print("\nПакетный режим:")
+    for q, preds in zip(test_queries, clf.predict_batch(test_queries, top_k=1)):
+        print(f"  {q!r:45} → {preds[0].command} ({preds[0].score:.3f})")
+
+
+if __name__ == "__main__":
+    _demo()
+
+
+
+pip install sentence-transformers numpy rapidfuzz
+python command_classifier.py
+
+
+
+
+
+
+
+
+
 
