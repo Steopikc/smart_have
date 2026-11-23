@@ -2,14 +2,16 @@
 data_io.py — импорт базы данных и загрузка телеметрии по проводу (COM/USB).
 
 Поддерживаемые форматы по проводу (строка за строкой):
-  1) JSON: {"hive_code":"RB-HIVE-0001","record_date":"2026-06-01",
+  1) JSON: {"hive_code":"RB-HIVE-0001","record_datetime":"2026-06-01 14:00:00",
             "internal_temp_c":34.2,"internal_humidity_pct":55,...}
   2) CSV с заголовком (разделитель ; или ,)
   3) Простой key=value;key=value (для отладочных прошивок)
 
 Обязательные поля для записи в hive_sensor_logs:
-  hive_id ИЛИ hive_code, record_date
-Остальные поля — по возможности.
+  hive_id ИЛИ hive_code, и record_date ИЛИ record_datetime
+Остальные поля — по возможности. Схема (record_date vs record_datetime,
+daily_ vs hourly_weight_delta_kg) определяется автоматически.
+Поддерживаются pesticide_risk и hive_health_index (basafor25bees.sql).
 """
 
 from __future__ import annotations
@@ -49,16 +51,23 @@ def validate_db(path: str | Path) -> tuple[bool, str]:
             missing = [t for t in REQUIRED_TABLES if t not in tables]
             if missing:
                 return False, f"В базе нет таблиц: {', '.join(missing)}"
+
             required = {
                 "apiaries": {"apiary_id", "name"},
                 "hives": {"hive_id", "apiary_id", "hive_code"},
-                "hive_sensor_logs": {"hive_id", "record_date"},
             }
             for table, needed in required.items():
                 actual = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
                 absent = sorted(needed - actual)
                 if absent:
                     return False, f"В таблице {table} отсутствуют поля: {', '.join(absent)}"
+
+            actual = {r[1] for r in c.execute("PRAGMA table_info(hive_sensor_logs)")}
+            if "hive_id" not in actual:
+                return False, "В hive_sensor_logs отсутствует поле hive_id"
+            if "record_date" not in actual and "record_datetime" not in actual:
+                return False, "В hive_sensor_logs нет ни record_date, ни record_datetime"
+
             check = c.execute("PRAGMA quick_check").fetchone()
             if check and check[0] != "ok":
                 return False, f"Проверка целостности SQLite: {check[0]}"
@@ -87,7 +96,6 @@ def import_database(
         raise RuntimeError(msg)
 
     if mode == "replace":
-        # Сначала копируем во временный файл: при ошибке текущая БД не теряется.
         if source.resolve() == target.resolve():
             return f"Эта база уже активна: {target.name}"
         temp = target.with_name(target.stem + ".replacement" + target.suffix)
@@ -111,66 +119,89 @@ def import_database(
         src = connect(source)
         dst = connect(target)
         try:
-            # До слияния проверяем совместимость колонок и совпадающих ID:
-            # иначе можно незаметно привязать телеметрию к чужому улью.
-            for table in ("apiaries", "hives", "hive_sensor_logs"):
+            src_tables = {r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            dst_tables = {r[0] for r in dst.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            weather_tables = [t for t in ("daily_weather", "hourly_weather")
+                              if t in src_tables and t in dst_tables]
+
+            merge_tables = ["apiaries", "hives", *weather_tables, "hive_sensor_logs"]
+
+            for table in merge_tables:
                 src_cols = {r[1] for r in src.execute(f"PRAGMA table_info({table})")}
                 dst_cols = {r[1] for r in dst.execute(f"PRAGMA table_info({table})")}
                 missing_cols = src_cols - dst_cols
                 if missing_cols:
-                    raise RuntimeError(f"Слияние невозможно: в целевой таблице {table} нет полей {', '.join(sorted(missing_cols))}. Используйте замену базы.")
+                    raise RuntimeError(
+                        f"Слияние невозможно: в целевой таблице {table} нет полей "
+                        f"{', '.join(sorted(missing_cols))}. Используйте замену базы."
+                    )
+
             for table, key, compare_cols in (
                 ("apiaries", "apiary_id", ("name",)),
                 ("hives", "hive_id", ("apiary_id", "hive_code")),
             ):
-                source_rows = src.execute(f"SELECT * FROM {table}").fetchall()
                 src_names = [r[1] for r in src.execute(f"PRAGMA table_info({table})")]
-                for row in source_rows:
-                    existing = dst.execute(f"SELECT * FROM {table} WHERE {key}=?", (row[src_names.index(key)],)).fetchone()
+                dst_names = [r[1] for r in dst.execute(f"PRAGMA table_info({table})")]
+                for row in src.execute(f"SELECT * FROM {table}"):
+                    existing = dst.execute(
+                        f"SELECT * FROM {table} WHERE {key}=?",
+                        (row[src_names.index(key)],)
+                    ).fetchone()
                     if existing:
-                        dst_names = [r[1] for r in dst.execute(f"PRAGMA table_info({table})")]
                         for col in compare_cols:
-                            if col in src_names and col in dst_names and existing[dst_names.index(col)] != row[src_names.index(col)]:
-                                raise RuntimeError(f"Конфликт {table}.{key}: ID {row[src_names.index(key)]} уже занят другой записью. Используйте замену базы.")
-            # apiaries / hives — INSERT OR IGNORE по PRIMARY KEY
-            for table in ("apiaries", "hives", "daily_weather"):
+                            if col in src_names and col in dst_names:
+                                if existing[dst_names.index(col)] != row[src_names.index(col)]:
+                                    raise RuntimeError(
+                                        f"Конфликт {table}.{key}: ID "
+                                        f"{row[src_names.index(key)]} уже занят "
+                                        f"другой записью. Используйте замену базы."
+                                    )
+
+            # справочники + погода: INSERT OR IGNORE,
+            # у hourly_weather удаляем искусственный weather_id.
+            for table in ["apiaries", "hives", *weather_tables]:
                 cols = [r[1] for r in src.execute(f"PRAGMA table_info({table})").fetchall()]
                 if not cols:
                     continue
-                col_list = ", ".join(cols)
-                placeholders = ", ".join("?" * len(cols))
-                rows = src.execute(f"SELECT {col_list} FROM {table}").fetchall()
+                drop_col = ("weather_id" if table in ("daily_weather", "hourly_weather")
+                            and "weather_id" in cols else None)
+                cols_use = [c for c in cols if c != drop_col] if drop_col else cols
+                col_list = ", ".join(cols_use)
+                placeholders = ", ".join("?" * len(cols_use))
+                data = []
+                for r in src.execute(f"SELECT {', '.join(cols)} FROM {table}"):
+                    t = list(r)
+                    if drop_col:
+                        t.pop(cols.index(drop_col))
+                    data.append(tuple(t))
                 dst.executemany(
                     f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
-                    [tuple(r) for r in rows],
-                )
-            # sensor logs — без дублей по (hive_id, record_date) по возможности
-            cols = [r[1] for r in src.execute("PRAGMA table_info(hive_sensor_logs)").fetchall()]
-            col_list = ", ".join(cols)
-            placeholders = ", ".join("?" * len(cols))
-            rows = src.execute(f"SELECT {col_list} FROM hive_sensor_logs").fetchall()
-            # log_id может конфликтовать — убираем его при вставке, если есть
-            if "log_id" in cols:
-                idx = cols.index("log_id")
-                cols_wo = [c for c in cols if c != "log_id"]
-                col_list_wo = ", ".join(cols_wo)
-                ph_wo = ", ".join("?" * len(cols_wo))
-                data = []
-                for r in rows:
-                    t = list(r)
-                    t.pop(idx)
-                    data.append(tuple(t))
-                before = dst.execute("SELECT COUNT(*) FROM hive_sensor_logs").fetchone()[0]
-                dst.executemany(
-                    f"INSERT OR IGNORE INTO hive_sensor_logs ({col_list_wo}) VALUES ({ph_wo})",
                     data,
                 )
+
+            # телеметрия: всегда убираем log_id, чтобы PK не конфликтовал
+            cols = [r[1] for r in src.execute("PRAGMA table_info(hive_sensor_logs)").fetchall()]
+            if "log_id" in cols:
+                drop_idx = cols.index("log_id")
+                cols_use = [c for c in cols if c != "log_id"]
             else:
-                before = dst.execute("SELECT COUNT(*) FROM hive_sensor_logs").fetchone()[0]
-                dst.executemany(
-                    f"INSERT OR IGNORE INTO hive_sensor_logs ({col_list}) VALUES ({placeholders})",
-                    [tuple(r) for r in rows],
-                )
+                drop_idx = -1
+                cols_use = cols
+            col_list = ", ".join(cols_use)
+            placeholders = ", ".join("?" * len(cols_use))
+            before = dst.execute("SELECT COUNT(*) FROM hive_sensor_logs").fetchone()[0]
+            data = []
+            for r in src.execute(f"SELECT {', '.join(cols)} FROM hive_sensor_logs"):
+                t = list(r)
+                if drop_idx >= 0:
+                    t.pop(drop_idx)
+                data.append(tuple(t))
+            dst.executemany(
+                f"INSERT OR IGNORE INTO hive_sensor_logs ({col_list}) VALUES ({placeholders})",
+                data,
+            )
             after = dst.execute("SELECT COUNT(*) FROM hive_sensor_logs").fetchone()[0]
             dst.commit()
             return f"Слияние завершено. Записей телеметрии: было {before}, стало {after}."
@@ -213,42 +244,24 @@ def import_sql_script(sql_path: str | Path, target: str | Path) -> str:
 # Парсинг строк с датчика
 # ---------------------------------------------------------------------------
 
+# [25 BEES] добавлены pesticide_risk и hive_health_index
 SENSOR_FIELDS = [
-    "hive_id",
-    "hive_code",
-    "record_date",
-    "internal_temp_c",
-    "internal_humidity_pct",
-    "co2_ppm",
-    "hive_weight_kg",
-    "daily_weight_delta_kg",
-    "lid_opened_count",
-    "lid_event_cause",
-    "is_tipped_over",
-    "tipping_cause",
-    "sound_level_db",
-    "bee_activity_index",
-    "estimated_flights_count",
-    "ambient_temp_c",
-    "anomaly_flag",
-    "anomaly_description",
-    "record_datetime"
+    "hive_id", "hive_code", "record_date", "record_datetime",
+    "internal_temp_c", "internal_humidity_pct", "co2_ppm",
+    "hive_weight_kg", "daily_weight_delta_kg", "hourly_weight_delta_kg",
+    "lid_opened_count", "lid_event_cause", "is_tipped_over", "tipping_cause",
+    "sound_level_db", "bee_activity_index", "estimated_flights_count",
+    "pesticide_risk", "hive_health_index",
+    "ambient_temp_c", "anomaly_flag", "anomaly_description",
 ]
 
 NUMERIC_FIELDS = {
-    "hive_id",
-    "internal_temp_c",
-    "internal_humidity_pct",
-    "co2_ppm",
-    "hive_weight_kg",
-    "daily_weight_delta_kg",
-    "lid_opened_count",
-    "is_tipped_over",
-    "sound_level_db",
-    "bee_activity_index",
-    "estimated_flights_count",
-    "ambient_temp_c",
-    "anomaly_flag",
+    "hive_id", "internal_temp_c", "internal_humidity_pct", "co2_ppm",
+    "hive_weight_kg", "daily_weight_delta_kg", "hourly_weight_delta_kg",
+    "lid_opened_count", "is_tipped_over", "sound_level_db",
+    "bee_activity_index", "estimated_flights_count",
+    "pesticide_risk", "hive_health_index",
+    "ambient_temp_c", "anomaly_flag",
 }
 
 
@@ -258,7 +271,8 @@ def _coerce(field: str, value: Any) -> Any:
     if field in NUMERIC_FIELDS:
         try:
             if field in ("hive_id", "co2_ppm", "lid_opened_count", "is_tipped_over",
-                         "bee_activity_index", "estimated_flights_count", "anomaly_flag"):
+                         "bee_activity_index", "estimated_flights_count",
+                         "pesticide_risk", "anomaly_flag"):
                 return int(float(str(value).replace(",", ".")))
             return float(str(value).replace(",", "."))
         except (TypeError, ValueError):
@@ -273,7 +287,6 @@ def parse_sensor_line(line: str) -> dict[str, Any] | None:
 
     data: dict[str, Any] = {}
 
-    # JSON
     if line.startswith("{"):
         try:
             obj = json.loads(line)
@@ -285,7 +298,6 @@ def parse_sensor_line(line: str) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             pass
 
-    # key=value;key=value
     if "=" in line and ("|" in line or ";" in line or "," in line):
         parts = re.split(r"[|;]", line)
         for p in parts:
@@ -298,7 +310,6 @@ def parse_sensor_line(line: str) -> dict[str, Any] | None:
         if data:
             return data
 
-    # CSV-like without header (positional — не используем без заголовка)
     return None
 
 
@@ -345,43 +356,49 @@ def insert_sensor_rows(
     default_date: str | None = None,
 ) -> tuple[int, int, list[str]]:
     """
-    Вставляет строки в hive_sensor_logs.
+    Вставляет строки в hive_sensor_logs, автоматически определяя
+    схему (record_date vs record_datetime, daily_ vs hourly_weight_delta_kg).
+    [25 BEES] Учитывает pesticide_risk, hive_health_index.
     Returns: (inserted, skipped, errors)
     """
     inserted = 0
     skipped = 0
     errors: list[str] = []
 
-    cols = [
-        "hive_id", "record_date", "internal_temp_c", "internal_humidity_pct",
-        "co2_ppm", "hive_weight_kg", "daily_weight_delta_kg", "lid_opened_count",
-        "lid_event_cause", "is_tipped_over", "tipping_cause", "sound_level_db",
-        "bee_activity_index", "estimated_flights_count", "ambient_temp_c",
-        "anomaly_flag", "anomaly_description",
-    ]
-    # defaults for NOT NULL columns if missing
-    defaults = {
-        "internal_temp_c": 0.0,
-        "internal_humidity_pct": 0.0,
-        "co2_ppm": 0,
-        "hive_weight_kg": 0.0,
-        "daily_weight_delta_kg": 0.0,
-        "lid_opened_count": 0,
-        "lid_event_cause": "Нет",
-        "is_tipped_over": 0,
-        "tipping_cause": "Нет",
-        "sound_level_db": 0.0,
-        "bee_activity_index": 0,
-        "estimated_flights_count": 0,
-        "ambient_temp_c": 0.0,
-        "anomaly_flag": 0,
-        "anomaly_description": None,
-    }
+    table_cols = {r[1] for r in db.execute("PRAGMA table_info(hive_sensor_logs)")}
+    if "hive_id" not in table_cols:
+        return 0, len(rows), ["В hive_sensor_logs отсутствует hive_id"]
 
+    time_col = "record_datetime" if "record_datetime" in table_cols else "record_date"
+
+    # [25 BEES] добавили pesticide_risk и hive_health_index
+    candidate = [
+        "internal_temp_c", "internal_humidity_pct", "co2_ppm",
+        "hive_weight_kg", "daily_weight_delta_kg", "hourly_weight_delta_kg",
+        "lid_opened_count", "lid_event_cause", "is_tipped_over", "tipping_cause",
+        "sound_level_db", "bee_activity_index", "estimated_flights_count",
+        "pesticide_risk", "hive_health_index",
+        "ambient_temp_c", "anomaly_flag", "anomaly_description",
+    ]
+    payload_cols = [c for c in candidate if c in table_cols]
+
+    all_cols = ["hive_id", time_col] + payload_cols
     sql = (
-        f"INSERT INTO hive_sensor_logs ({', '.join(cols)}) "
-        f"VALUES ({', '.join('?' * len(cols))})"
+        f"INSERT INTO hive_sensor_logs ({', '.join(all_cols)}) "
+        f"VALUES ({', '.join('?' * len(all_cols))})"
     )
+
+    defaults = {
+        "internal_temp_c": 0.0, "internal_humidity_pct": 0.0,
+        "co2_ppm": 0, "hive_weight_kg": 0.0,
+        "daily_weight_delta_kg": 0.0, "hourly_weight_delta_kg": 0.0,
+        "lid_opened_count": 0, "lid_event_cause": "Нет",
+        "is_tipped_over": 0, "tipping_cause": "Нет",
+        "sound_level_db": 0.0, "bee_activity_index": 0,
+        "estimated_flights_count": 0,
+        "pesticide_risk": 0, "hive_health_index": 5.0,
+        "ambient_temp_c": 0.0, "anomaly_flag": 0, "anomaly_description": None,
+    }
 
     for i, row in enumerate(rows, 1):
         try:
@@ -390,18 +407,19 @@ def insert_sensor_rows(
                 skipped += 1
                 errors.append(f"Строка {i}: не найден улей (hive_id/hive_code)")
                 continue
-            rec_date = row.get("record_date") or default_date or date.today().isoformat()
-            values = []
-            for c in cols:
-                if c == "hive_id":
-                    values.append(hive_id)
-                elif c == "record_date":
-                    values.append(rec_date)
-                else:
-                    v = row.get(c)
-                    if v is None:
-                        v = defaults.get(c)
-                    values.append(v)
+            rec_time = (
+                row.get(time_col)
+                or row.get("record_datetime")
+                or row.get("record_date")
+                or default_date
+                or date.today().isoformat()
+            )
+            values: list[Any] = [hive_id, rec_time]
+            for c in payload_cols:
+                v = row.get(c)
+                if v is None:
+                    v = defaults.get(c)
+                values.append(v)
             db.execute(sql, values)
             inserted += 1
         except Exception as e:  # noqa: BLE001
