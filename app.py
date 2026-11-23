@@ -9,19 +9,21 @@ import traceback
 from pathlib import Path
 from datetime import date, timedelta
 
-from PySide6.QtCore import Qt, QDate, QTimer, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QDate, QTimer, QThread, Signal, QObject, QSize
 from PySide6.QtGui import QFont, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QStackedWidget, QComboBox, QDateEdit,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QMessageBox, QLineEdit, QScrollArea, QFileDialog, QDialog, QDialogButtonBox,
-    QFormLayout, QRadioButton, QSpinBox, QPlainTextEdit
+    QFormLayout, QRadioButton, QSpinBox, QPlainTextEdit, QSizePolicy
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from ai_connector import build_context_from_db, get_ai_response, check_llm_available
+from ai_connector import (
+    build_context_from_db, get_ai_response, check_llm_available, clear_caches,
+)
 from data_io import (
     import_database, import_sql_script, validate_db, list_serial_ports,
     read_serial_lines, parse_sensor_line, parse_csv_block, insert_sensor_rows,
@@ -29,7 +31,12 @@ from data_io import (
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'digital_hive.db'
-SQL_CANDIDATES = [ROOT / 'smart_apiary_100_hives_hourly.sql', ROOT / 'pensil.sql']
+# [25 BEES] сначала пробуем новую базу
+SQL_CANDIDATES = [
+    ROOT / 'basafor25bees.sql',
+    ROOT / 'smart_apiary_100_hives_hourly.sql',
+    ROOT / 'pensil.sql',
+]
 
 P = '#F4511E'
 P_DARK = '#D84315'
@@ -43,8 +50,18 @@ BORDER = '#E6E8F0'
 
 
 def connect(path):
+    """PRAGMA для работы с БД на миллионы строк."""
     c = sqlite3.connect(str(path))
     c.row_factory = sqlite3.Row
+    for pragma in (
+        'PRAGMA cache_size=-64000',
+        'PRAGMA mmap_size=268435456',
+        'PRAGMA temp_store=MEMORY',
+    ):
+        try:
+            c.execute(pragma)
+        except sqlite3.Error:
+            pass
     return c
 
 
@@ -72,7 +89,7 @@ def init_db():
 
     sql_path = _find_sql()
     if sql_path is None:
-        # Запуск без демо-SQL: пользователь сможет импортировать свою базу из интерфейса.
+        # [25 BEES] обновлена демо-схема: pesticide_risk, hive_health_index
         c = sqlite3.connect(str(DB))
         c.executescript('''
             CREATE TABLE IF NOT EXISTS apiaries (apiary_id INTEGER PRIMARY KEY, name TEXT NOT NULL, district TEXT);
@@ -82,10 +99,12 @@ def init_db():
                 record_date TEXT NOT NULL, record_datetime TEXT,
                 internal_temp_c REAL DEFAULT 0, internal_humidity_pct REAL DEFAULT 0,
                 co2_ppm REAL DEFAULT 0, hive_weight_kg REAL DEFAULT 0,
-                daily_weight_delta_kg REAL DEFAULT 0, lid_opened_count INTEGER DEFAULT 0,
+                daily_weight_delta_kg REAL DEFAULT 0, hourly_weight_delta_kg REAL DEFAULT 0,
+                lid_opened_count INTEGER DEFAULT 0,
                 lid_event_cause TEXT DEFAULT 'Нет', is_tipped_over INTEGER DEFAULT 0,
                 tipping_cause TEXT DEFAULT 'Нет', sound_level_db REAL DEFAULT 0,
                 bee_activity_index REAL DEFAULT 0, estimated_flights_count INTEGER DEFAULT 0,
+                pesticide_risk INTEGER DEFAULT 0, hive_health_index REAL DEFAULT 5.0,
                 ambient_temp_c REAL DEFAULT 0, anomaly_flag INTEGER DEFAULT 0, anomaly_description TEXT
             );
             CREATE TABLE IF NOT EXISTS daily_weather (
@@ -108,11 +127,14 @@ def init_db():
 
     c = sqlite3.connect(str(DB))
     try:
+        print(f'Инициализация БД из {sql_path.name} — может занять 30–90 секунд…',
+              flush=True)
         c.execute('PRAGMA journal_mode = OFF;')
         c.execute('PRAGMA synchronous = OFF;')
         c.execute('PRAGMA cache_size = -64000;')
         c.executescript(sql_path.read_text(encoding='utf-8'))
         c.commit()
+        print(f'БД создана: {DB}', flush=True)
     except Exception as e:
         c.close()
         if DB.exists():
@@ -122,6 +144,14 @@ def init_db():
                 pass
         raise RuntimeError(f'Ошибка создания БД из {sql_path.name}:\n{e}') from e
     c.close()
+
+    try:
+        cc = sqlite3.connect(str(DB))
+        cc.execute('PRAGMA journal_mode=WAL')
+        cc.execute('PRAGMA synchronous=NORMAL')
+        cc.close()
+    except sqlite3.Error:
+        pass
 
 
 class Card(QFrame):
@@ -296,6 +326,8 @@ class Window(QMainWindow):
         self._ai_worker = None
         self._ai_busy = False
         self._welcome = None
+        self._typing_row = None
+        self._last_bubble_role = None
         self.build()
         self.load_filters()
         self.chart()
@@ -385,74 +417,152 @@ class Window(QMainWindow):
         outer.addWidget(area, 1)
         self.page(1)
 
+    # ---------- ИИ-ЧАТ (НОВЫЙ ДИЗАЙН) ----------
     def ai_page(self):
         w = QWidget()
         l = QVBoxLayout(w)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(14)
+
+        # --- Hero-карточка ---
         hero = Card(accent_color=P)
         h = QHBoxLayout(hero)
-        h.setContentsMargins(22, 16, 22, 16)
+        h.setContentsMargins(24, 18, 24, 18)
         x = QVBoxLayout()
-        x.setSpacing(2)
+        x.setSpacing(4)
         tag = QLabel('ИИ · LM STUDIO')
         tag.setObjectName('eyebrow')
         x.addWidget(tag)
         title = QLabel('Консультант пчеловода')
-        title.setStyleSheet(f'font-size: 20px; font-weight: 800; color: {INK};')
+        title.setStyleSheet(f'font-size: 22px; font-weight: 800; color: {INK};')
         x.addWidget(title)
+        subtitle = QLabel('Задайте вопрос — модель проанализирует телеметрию выбранного улья')
+        subtitle.setStyleSheet(f'font-size: 13px; color: {MUTED};')
+        x.addWidget(subtitle)
         h.addLayout(x, 1)
+
         self.llm_status = QLabel('Проверка модели…')
-        self.llm_status.setStyleSheet(f'color: {MUTED}; font-size: 12px; font-weight: 600;')
-        h.addWidget(self.llm_status)
+        self.llm_status.setStyleSheet(
+            f'background: {P_SOFT}; color: {P}; font-size: 12px; font-weight: 700; '
+            f'padding: 6px 12px; border-radius: 8px;'
+        )
+        h.addWidget(self.llm_status, 0, alignment=Qt.AlignTop)
+
         clear_btn = QPushButton('Очистить')
         clear_btn.setObjectName('secondary')
         clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setMinimumHeight(34)
         clear_btn.clicked.connect(self.clear_chat)
-        h.addWidget(clear_btn)
+        h.addWidget(clear_btn, 0, alignment=Qt.AlignTop)
         l.addWidget(hero)
+
+        # --- Карточка чата ---
         c = Card()
         cl = QVBoxLayout(c)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
+
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setFrameShape(QFrame.NoFrame)
         self.chat_scroll.setObjectName('chatScroll')
         self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_scroll.setStyleSheet(
+            'QScrollArea#chatScroll { background: #FBFBFE; border: 0; }'
+            'QScrollArea#chatScroll QScrollBar:vertical {'
+            '    background: transparent; width: 10px; margin: 6px 2px 6px 0; }'
+            'QScrollArea#chatScroll QScrollBar::handle:vertical {'
+            '    background: #D5D8E2; border-radius: 4px; min-height: 40px; }'
+            'QScrollArea#chatScroll QScrollBar::handle:vertical:hover {'
+            '    background: #B8BCC9; }'
+            'QScrollArea#chatScroll QScrollBar::add-line:vertical,'
+            'QScrollArea#chatScroll QScrollBar::sub-line:vertical { height: 0; }'
+        )
+
         self.chat_container = QWidget()
         self.chat_container.setObjectName('chatContainer')
+        self.chat_container.setStyleSheet('QWidget#chatContainer { background: #FBFBFE; }')
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setContentsMargins(18, 16, 18, 16)
-        self.chat_layout.setSpacing(12)
+        self.chat_layout.setContentsMargins(28, 24, 28, 24)
+        self.chat_layout.setSpacing(4)
         self.chat_layout.addStretch(1)
-        self._welcome = QLabel('⬡  Задайте вопрос о состоянии ульев, аномалиях или погоде.\nКонтекст — пасека / улей с вкладки «Аналитика».')
-        self._welcome.setWordWrap(True)
-        self._welcome.setAlignment(Qt.AlignCenter)
-        self._welcome.setStyleSheet(f'color: {MUTED}; font-size: 13px; padding: 40px 24px;')
+
+        self._welcome = self._make_welcome_widget()
         self.chat_layout.insertWidget(0, self._welcome)
+
         self.chat_scroll.setWidget(self.chat_container)
         cl.addWidget(self.chat_scroll, 1)
+
+        # --- Панель ввода ---
         input_bar = QFrame()
         input_bar.setObjectName('chatInputBar')
+        input_bar.setStyleSheet(
+            f'QFrame#chatInputBar {{ background: white; border-top: 1px solid {BORDER}; '
+            f'border-bottom-left-radius: 14px; border-bottom-right-radius: 14px; }}'
+        )
         ib = QHBoxLayout(input_bar)
-        ib.setContentsMargins(14, 12, 14, 14)
-        ib.setSpacing(10)
+        ib.setContentsMargins(18, 14, 18, 16)
+        ib.setSpacing(12)
+
         self.chat_input = QLineEdit()
         self.chat_input.setObjectName('chatInput')
-        self.chat_input.setPlaceholderText('Напишите сообщение…  Enter — отправить')
-        self.chat_input.setMinimumHeight(42)
+        self.chat_input.setPlaceholderText('Спросите что-нибудь о состоянии ульев…')
+        self.chat_input.setMinimumHeight(48)
+        self.chat_input.setStyleSheet(
+            f'#chatInput {{ background: #F5F6FA; border: 1px solid {BORDER}; '
+            f'border-radius: 14px; padding: 12px 18px; font-size: 14px; }}'
+            f'#chatInput:focus {{ border-color: {P}; background: white; }}'
+        )
         self.chat_input.returnPressed.connect(self.send_chat)
         ib.addWidget(self.chat_input, 1)
+
         self.send_btn = QPushButton('➤  Отправить')
         self.send_btn.setObjectName('primary')
         self.send_btn.setCursor(Qt.PointingHandCursor)
-        self.send_btn.setMinimumHeight(42)
+        self.send_btn.setMinimumHeight(48)
+        self.send_btn.setMinimumWidth(140)
+        self.send_btn.setStyleSheet(
+            f'QPushButton#primary {{ background: {P}; color: white; border: 0; '
+            f'border-radius: 14px; padding: 12px 20px; font-size: 14px; font-weight: 700; }}'
+            f'QPushButton#primary:hover {{ background: {P_DARK}; }}'
+            f'QPushButton#primary:disabled {{ background: #FDBA74; }}'
+        )
         self.send_btn.clicked.connect(self.send_chat)
         ib.addWidget(self.send_btn)
+
         cl.addWidget(input_bar)
         l.addWidget(c, 1)
         return w
+
+    def _make_welcome_widget(self):
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 40, 0, 40)
+        v.setSpacing(10)
+
+        icon = QLabel('⬡')
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet(
+            f'background: {P_SOFT}; color: {P}; font-size: 30px; font-weight: 800; '
+            f'border-radius: 24px; padding: 10px;'
+        )
+        icon.setFixedSize(64, 64)
+        v.addWidget(icon, 0, alignment=Qt.AlignHCenter)
+
+        title = QLabel('Чем помочь?')
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f'font-size: 20px; font-weight: 800; color: {INK};')
+        v.addWidget(title)
+
+        hint = QLabel(
+            'Спросите о температуре, влажности, аномалиях или\n'
+            'погоде — модель проанализирует выбранный улей.'
+        )
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f'font-size: 14px; color: {MUTED}; line-height: 1.4;')
+        v.addWidget(hint)
+        return box
 
     def clear_chat(self):
         self.chat_history.clear()
@@ -461,48 +571,146 @@ class Window(QMainWindow):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        self._welcome = QLabel('⬡  Задайте вопрос о состоянии ульев, аномалиях или погоде.')
-        self._welcome.setWordWrap(True)
-        self._welcome.setAlignment(Qt.AlignCenter)
-        self._welcome.setStyleSheet(f'color: {MUTED}; font-size: 13px; padding: 40px 24px;')
+        self._typing_row = None
+        self._last_bubble_role = None
+        self._welcome = self._make_welcome_widget()
         self.chat_layout.insertWidget(0, self._welcome)
+
+    def _show_typing_indicator(self):
+        try:
+            self._hide_typing_indicator()
+            row = QWidget()
+            row.setObjectName('typingRow')
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(0, 6, 0, 6)
+            row_l.setSpacing(12)
+
+            avatar = QLabel('⬡')
+            avatar.setFixedSize(42, 42)
+            avatar.setAlignment(Qt.AlignCenter)
+            avatar.setStyleSheet(
+                f'background: {P_SOFT}; color: {P}; border-radius: 21px; '
+                f'font-size: 20px; font-weight: 800;'
+            )
+
+            bubble = QLabel('●  ●  ●')
+            bubble.setStyleSheet(
+                f'background: white; color: {P}; border: 1px solid {BORDER}; '
+                f'border-radius: 18px; border-top-left-radius: 6px; '
+                f'padding: 14px 20px; font-size: 15px; letter-spacing: 4px;'
+            )
+
+            row_l.addWidget(avatar, 0, alignment=Qt.AlignTop)
+            row_l.addWidget(bubble, 0, alignment=Qt.AlignTop)
+            row_l.addStretch(1)
+
+            self._typing_row = row
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, row)
+            QTimer.singleShot(40, self._scroll_chat_bottom)
+        except Exception as e:
+            print('typing:', e, file=sys.stderr)
+
+    def _hide_typing_indicator(self):
+        try:
+            if getattr(self, '_typing_row', None) is not None:
+                self._typing_row.setParent(None)
+                self._typing_row.deleteLater()
+                self._typing_row = None
+        except Exception:
+            pass
 
     def _append_chat_bubble(self, role, text):
         try:
             text = str(text or '')
             if len(text) > 50000:
                 text = text[:50000] + '\n\n… [обрезано]'
+
             if self._welcome is not None:
                 self.chat_layout.removeWidget(self._welcome)
                 self._welcome.deleteLater()
                 self._welcome = None
+
+            last_role = getattr(self, '_last_bubble_role', None)
+            show_avatar = (last_role != role)
+            self._last_bubble_role = role
+
             row = QWidget()
             row_l = QHBoxLayout(row)
-            row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(10)
+            row_l.setContentsMargins(0, 6 if show_avatar else 1, 0, 6)
+            row_l.setSpacing(12)
+
             avatar = QLabel('⬡' if role != 'user' else 'Вы')
-            avatar.setFixedSize(36, 36)
+            avatar.setFixedSize(42, 42)
             avatar.setAlignment(Qt.AlignCenter)
             if role == 'user':
-                avatar.setStyleSheet(f'background: {P}; color: white; border-radius: 18px; font-size: 11px; font-weight: 700;')
+                avatar.setStyleSheet(
+                    f'background: {P}; color: white; border-radius: 21px; '
+                    f'font-size: 12px; font-weight: 800;'
+                )
             else:
-                avatar.setStyleSheet(f'background: {P_SOFT}; color: {P}; border-radius: 18px; font-size: 16px; font-weight: 800;')
+                avatar.setStyleSheet(
+                    f'background: {P_SOFT}; color: {P}; border-radius: 21px; '
+                    f'font-size: 20px; font-weight: 800;'
+                )
+
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(4)
+
             bubble = QLabel(text)
             bubble.setWordWrap(True)
             bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            bubble.setMaximumWidth(620)
+            bubble.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            bubble.setMaximumWidth(max(320, int(self.chat_scroll.width() * 0.72)))
+
+            ts = QLabel()
+            ts.setStyleSheet(f'font-size: 11px; color: {MUTED}; padding: 0 6px;')
+
             if role == 'user':
-                bubble.setStyleSheet(f'background: {P}; color: white; border-radius: 16px; border-top-right-radius: 4px; padding: 12px 16px; font-size: 13px;')
-                row_l.addStretch(1)
-                row_l.addWidget(bubble, 0, alignment=Qt.AlignRight | Qt.AlignTop)
-                row_l.addWidget(avatar, 0, alignment=Qt.AlignTop)
+                bubble.setStyleSheet(
+                    f'background: {P}; color: white; border-radius: 18px; '
+                    f'border-top-right-radius: 6px; padding: 14px 20px; '
+                    f'font-size: 15px; line-height: 1.4;'
+                )
+                ts.setText('Вы · только что')
+                ts.setAlignment(Qt.AlignRight)
+                col.addWidget(bubble, 0, alignment=Qt.AlignRight)
+                col.addWidget(ts, 0, alignment=Qt.AlignRight)
+
+                if show_avatar:
+                    row_l.addStretch(1)
+                    row_l.addLayout(col, 0)
+                    row_l.addWidget(avatar, 0, alignment=Qt.AlignTop)
+                else:
+                    row_l.addStretch(1)
+                    spacer = QWidget()
+                    spacer.setFixedWidth(54)
+                    row_l.addLayout(col, 0)
+                    row_l.addWidget(spacer, 0, alignment=Qt.AlignTop)
             else:
-                bubble.setStyleSheet(f'background: white; color: {INK}; border: 1px solid {BORDER}; border-radius: 16px; border-top-left-radius: 4px; padding: 12px 16px; font-size: 13px;')
-                row_l.addWidget(avatar, 0, alignment=Qt.AlignTop)
-                row_l.addWidget(bubble, 0, alignment=Qt.AlignLeft | Qt.AlignTop)
-                row_l.addStretch(1)
+                bubble.setStyleSheet(
+                    f'background: white; color: {INK}; border: 1px solid {BORDER}; '
+                    f'border-radius: 18px; border-top-left-radius: 6px; '
+                    f'padding: 14px 20px; font-size: 15px; line-height: 1.4;'
+                )
+                ts.setText('⬡ Консультант · только что')
+                ts.setAlignment(Qt.AlignLeft)
+                col.addWidget(bubble, 0, alignment=Qt.AlignLeft)
+                col.addWidget(ts, 0, alignment=Qt.AlignLeft)
+
+                if show_avatar:
+                    row_l.addWidget(avatar, 0, alignment=Qt.AlignTop)
+                    row_l.addLayout(col, 0)
+                    row_l.addStretch(1)
+                else:
+                    spacer = QWidget()
+                    spacer.setFixedWidth(54)
+                    row_l.addWidget(spacer, 0, alignment=Qt.AlignTop)
+                    row_l.addLayout(col, 0)
+                    row_l.addStretch(1)
+
             self.chat_layout.insertWidget(self.chat_layout.count() - 1, row)
-            QTimer.singleShot(30, self._scroll_chat_bottom)
+            QTimer.singleShot(40, self._scroll_chat_bottom)
         except Exception as e:
             print('chat:', e, file=sys.stderr)
 
@@ -516,7 +724,6 @@ class Window(QMainWindow):
     def _current_ai_context(self):
         try:
             d_from, d_to = None, None
-            # Если на вкладке аналитики выбран ручной период (индекс 5), передаём его ИИ
             if getattr(self, 'current_period_idx', 2) == 5:
                 d_from = self.start.date().toString('yyyy-MM-dd')
                 d_to = self.end.date().toString('yyyy-MM-dd')
@@ -533,6 +740,7 @@ class Window(QMainWindow):
             )
         except Exception as e:
             return {'error': str(e), 'latest_telemetry': [], 'recent_anomalies': []}
+
     def send_chat(self):
         text = self.chat_input.text().strip()
         if not text or self._ai_busy:
@@ -543,8 +751,13 @@ class Window(QMainWindow):
         self._ai_busy = True
         self.send_btn.setEnabled(False)
         self.chat_input.setEnabled(False)
-        self.llm_status.setText('Модель думает…')
-        self.llm_status.setStyleSheet(f'color: {O}; font-size: 12px; font-weight: 600;')
+        self.llm_status.setText('●  Модель думает…')
+        self.llm_status.setStyleSheet(
+            f'background: {O_SOFT}; color: {O}; font-size: 12px; font-weight: 700; '
+            f'padding: 6px 12px; border-radius: 8px;'
+        )
+        self._show_typing_indicator()
+
         context = self._current_ai_context()
         history = list(self.chat_history[:-1])
         thread = QThread(self)
@@ -561,6 +774,7 @@ class Window(QMainWindow):
         thread.start()
 
     def _on_ai_answer(self, answer):
+        self._hide_typing_indicator()
         try:
             self._append_chat_bubble('assistant', str(answer))
             self.chat_history.append({'role': 'assistant', 'content': str(answer)})
@@ -569,8 +783,9 @@ class Window(QMainWindow):
             self._refresh_llm_status()
 
     def _on_ai_error(self, err):
+        self._hide_typing_indicator()
         try:
-            self._append_chat_bubble('assistant', f'Ошибка: {err}')
+            self._append_chat_bubble('assistant', f'⚠ Ошибка: {err}')
         finally:
             self._restore_chat_controls()
             self._refresh_llm_status()
@@ -594,10 +809,20 @@ class Window(QMainWindow):
         try:
             ok, msg = check_llm_available()
             self.llm_status.setText(('● ' if ok else '○ ') + msg)
-            self.llm_status.setStyleSheet(f'color: {"#16A34A" if ok else O}; font-size: 12px; font-weight: 600;')
+            if ok:
+                self.llm_status.setStyleSheet(
+                    'background: #ECFDF5; color: #16A34A; font-size: 12px; '
+                    'font-weight: 700; padding: 6px 12px; border-radius: 8px;'
+                )
+            else:
+                self.llm_status.setStyleSheet(
+                    f'background: {O_SOFT}; color: {O}; font-size: 12px; '
+                    f'font-weight: 700; padding: 6px 12px; border-radius: 8px;'
+                )
         except Exception:
             pass
 
+    # ---------- АНАЛИТИКА ----------
     def analytics_page(self):
         w = QWidget()
         l = QVBoxLayout(w)
@@ -677,14 +902,14 @@ class Window(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(12)
         self.cards = {
-            'bee_activity_index': MetricCard('Активность пчёл', 'баллов', 'bar'),
+            'hive_health_index': MetricCard('Индекс здоровья', 'из 5', 'line'),
             'internal_temp_c': MetricCard('Температура', '°C', 'line'),
             'internal_humidity_pct': MetricCard('Влажность', '%', 'line'),
             'co2_ppm': MetricCard('Уровень CO₂', 'ppm', 'line'),
             'hive_weight_kg': MetricCard('Масса улья', 'кг', 'bar'),
             'sound_level_db': MetricCard('Звук в улье', 'дБ', 'line'),
         }
-        grid.addWidget(self.cards['bee_activity_index'], 0, 0)
+        grid.addWidget(self.cards['hive_health_index'], 0, 0)
         grid.addWidget(self.cards['internal_temp_c'], 0, 1)
         grid.addWidget(self.cards['internal_humidity_pct'], 0, 2)
         grid.addWidget(self.cards['co2_ppm'], 0, 3)
@@ -826,6 +1051,14 @@ class Window(QMainWindow):
     def _time_column(self):
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(hive_sensor_logs)").fetchall()}
         return "record_datetime" if "record_datetime" in cols else "record_date"
+
+    def _has_column(self, col: str) -> bool:
+        try:
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(hive_sensor_logs)").fetchall()}
+            return col in cols
+        except sqlite3.Error:
+            return False
+
     def chart(self):
         if not hasattr(self, 'cards'):
             return
@@ -871,18 +1104,40 @@ class Window(QMainWindow):
             if mode == 'hour':
                 mode = 'day'
         cond, args = self.where()
+
+        agg_fields = [
+            ("bee_activity_index", "bee_activity_index"),
+            ("internal_temp_c", "internal_temp_c"),
+            ("internal_humidity_pct", "internal_humidity_pct"),
+            ("co2_ppm", "co2_ppm"),
+            ("hive_weight_kg", "hive_weight_kg"),
+            ("sound_level_db", "sound_level_db"),
+            ("hive_health_index", "hive_health_index"),
+        ]
+        select_aggs = []
+        for col, alias in agg_fields:
+            if self._has_column(col):
+                select_aggs.append(f'AVG(l.{col}) AS {alias}')
+        select_aggs.append('SUM(l.anomaly_flag) AS anom')
+        if self._has_column("pesticide_risk"):
+            select_aggs.append('SUM(l.pesticide_risk) AS pest_hours')
+
         rows = self.db.execute(
-            f'SELECT {grp} AS bucket, AVG(l.bee_activity_index) AS bee_activity_index, '
-            f'AVG(l.internal_temp_c) AS internal_temp_c, AVG(l.internal_humidity_pct) AS internal_humidity_pct, '
-            f'AVG(l.co2_ppm) AS co2_ppm, AVG(l.hive_weight_kg) AS hive_weight_kg, '
-            f'AVG(l.sound_level_db) AS sound_level_db, SUM(l.anomaly_flag) AS anom '
+            f'SELECT {grp} AS bucket, {", ".join(select_aggs)} '
             f'FROM hive_sensor_logs l JOIN hives h ON h.hive_id = l.hive_id '
             f'WHERE {cond} AND l.{tcol} BETWEEN ? AND ? GROUP BY bucket ORDER BY bucket',
             args + [a, b],
         ).fetchall()
         labels = [(r['bucket'] + ':00') if mode == 'hour' else r['bucket'] for r in rows]
-        self.kpi_summary.setText(f'Аномалий за период: {sum(r["anom"] or 0 for r in rows)}')
+        anom_total = sum(r['anom'] or 0 for r in rows)
+        pest_total = sum((r['pest_hours'] or 0) for r in rows) if 'pest_hours' in rows[0].keys() else 0
+        self.kpi_summary.setText(
+            f'Аномалий за период: {anom_total}' + (f' · риск пестицидов: {pest_total} ч' if pest_total else '')
+        )
         for col, card in self.cards.items():
+            if col not in rows[0].keys():
+                card.render([], [])
+                continue
             vals = [float(r[col]) for r in rows if r[col] is not None]
             sub = [labels[i] for i, r in enumerate(rows) if r[col] is not None]
             card.render(sub, vals)
@@ -891,9 +1146,17 @@ class Window(QMainWindow):
         if not hasattr(self, 'table'):
             return
         tcol = self._time_column()
+        has_pest = self._has_column("pesticide_risk")
+        has_health = self._has_column("hive_health_index")
+        extra = []
+        if has_pest:
+            extra.append("l.pesticide_risk")
+        if has_health:
+            extra.append("l.hive_health_index")
+        extra_sql = (", " + ", ".join(extra)) if extra else ""
         sql = (
             f'SELECT l.{tcol} AS ts, a.name AS apiary, h.hive_code, l.anomaly_flag, l.anomaly_description, '
-            f'l.internal_temp_c, l.internal_humidity_pct, l.co2_ppm FROM hive_sensor_logs l '
+            f'l.internal_temp_c, l.internal_humidity_pct, l.co2_ppm{extra_sql} FROM hive_sensor_logs l '
             f'JOIN hives h ON h.hive_id = l.hive_id JOIN apiaries a ON a.apiary_id = h.apiary_id'
         )
         if self.only.currentIndex() == 1:
@@ -920,6 +1183,11 @@ class Window(QMainWindow):
             t_val = f"{r['internal_temp_c']} °C" if r['internal_temp_c'] is not None else '—'
             h_val = f"{r['internal_humidity_pct']}%" if r['internal_humidity_pct'] is not None else '—'
             c_val = f"CO₂ {r['co2_ppm']}" if r['co2_ppm'] is not None else '—'
+            keys = r.keys()
+            if 'hive_health_index' in keys and r['hive_health_index'] is not None:
+                t_val += f" · ИЗ {r['hive_health_index']}"
+            if 'pesticide_risk' in keys and r['pesticide_risk']:
+                c_val += " · ПЕСТИЦИДЫ"
             vals = [str(r['ts'] or '—'), str(r['apiary'] or '—'), str(r['hive_code'] or '—'), level, f'{t_val}  ·  {h_val}  ·  {c_val}', desc]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
@@ -932,6 +1200,8 @@ class Window(QMainWindow):
                         it.setBackground(QColor(O_SOFT))
                     else:
                         it.setForeground(QColor('#16A34A'))
+                elif j == 4 and 'pesticide_risk' in keys and r['pesticide_risk']:
+                    it.setForeground(QColor(O))
                 self.table.setItem(i, j, it)
         self.table.setUpdatesEnabled(True)
 
@@ -979,10 +1249,17 @@ class Window(QMainWindow):
             self.end.setDate(QDate.fromString(day_str, 'yyyy-MM-dd'))
             self.set_period(5)
             self.chart()
+            extra = ''
+            keys = row.keys()
+            if 'hive_health_index' in keys and row['hive_health_index'] is not None:
+                extra += f"\nИндекс здоровья: {row['hive_health_index']} / 5"
+            if 'pesticide_risk' in keys and row['pesticide_risk']:
+                extra += "\nРиск пестицидов: ДА"
             msg = (
                 f"Дата: {self.day.strftime('%d.%m.%Y')}\nПасека: {row['apiary']}\nУлей: {row['hive_code']}\n\n"
                 f"{row['anomaly_description'] or 'Отклонение'}\n\nВес: {row['hive_weight_kg']} кг\n"
                 f"Т: {row['internal_temp_c']} °C\nВлажн.: {row['internal_humidity_pct']}%\nCO₂: {row['co2_ppm']}"
+                f"{extra}"
             )
             QTimer.singleShot(50, lambda: QMessageBox.warning(self, 'Аномалия', msg))
             return
@@ -1006,13 +1283,16 @@ class Window(QMainWindow):
         except Exception:
             pass
         self.db = connect(DB)
+        try:
+            clear_caches()
+        except Exception:
+            pass
         self.load_filters()
         self.chart()
         self.alerts()
         db_counts = self.db.execute('SELECT COUNT(*) FROM hives').fetchone()[0]
         log_counts = self.db.execute('SELECT COUNT(*) FROM hive_sensor_logs').fetchone()[0]
         self.db_text.setText(f'SQLite · {db_counts} ульев · {log_counts} записей')
-        # Очищаем старый контекст диалога при загрузке новой базы
         if hasattr(self, 'chat_layout'):
             self.clear_chat()
             self._append_chat_bubble('assistant',
@@ -1128,7 +1408,7 @@ class Window(QMainWindow):
         lay.addWidget(log)
         buttons = QDialogButtonBox()
         btn_read = buttons.addButton('Читать с порта', QDialogButtonBox.ActionRole)
-        btn_apply = buttons.addButton('Записать в БД', QDialogButtonBox.AcceptRole)
+        buttons.addButton('Записать в БД', QDialogButtonBox.AcceptRole)
         buttons.addButton(QDialogButtonBox.Cancel)
         lay.addWidget(buttons)
         collected = []
@@ -1202,10 +1482,10 @@ def apply_style(app):
         "QProgressBar::chunk { background: " + O + "; border-radius: 3px; }"
         "QTableWidget { background: white; border: 0; alternate-background-color: #FAFBFD; selection-background-color: " + P_SOFT + "; }"
         "QHeaderView::section { background: #F6F7FB; border: 0; border-bottom: 1px solid " + BORDER + "; padding: 10px; font-weight: 700; color: #525866; }"
-        "#chatScroll { background: #FFF9F7; border: 0; }"
-        "#chatContainer { background: #FFF9F7; }"
+        "#chatScroll { background: #FBFBFE; border: 0; }"
+        "#chatContainer { background: #FBFBFE; }"
         "#chatInputBar { background: white; border-top: 1px solid " + BORDER + "; }"
-        "#chatInput { background: #FAFAFC; border: 1px solid " + BORDER + "; border-radius: 12px; padding: 10px 16px; font-size: 13px; }"
+        "#chatInput { background: #F5F6FA; border: 1px solid " + BORDER + "; border-radius: 14px; padding: 12px 18px; font-size: 14px; }"
         "#chatInput:focus { border-color: " + P + "; background: white; }"
     )
 
